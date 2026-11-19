@@ -30,6 +30,43 @@ func (f Function) reserveEscapeStack(typ Type) bool {
 	return true
 }
 
+func (p Program) stringConcatTable(n int) Type {
+	return p.Type(types.NewArray(types.Typ[types.String], int64(n)), GoDecl)
+}
+
+// ReserveStringConcatTable charges the operand table and its GC roots. Escape
+// analysis already accounts for the result buffer at the final addition.
+func (f Function) ReserveStringConcatTable(n int) bool {
+	return f.reserveEscapeStack(f.Prog.stringConcatTable(n))
+}
+
+// StringConcat concatenates parts and preserves the result's Go string type.
+// The caller must successfully call ReserveStringConcatTable before lowering.
+// useStackBuffer enables a separately budgeted result buffer only for a result
+// proven not to escape its invocation or loop iteration. Larger results still
+// allocate on the heap.
+func (b Builder) StringConcat(parts []Expr, resultType Type, useStackBuffer bool) Expr {
+	p := b.Prog
+	table := b.uninitializedStackSlot(p.stringConcatTable(len(parts)))
+	data := Expr{table.impl, p.Pointer(p.String())}
+	for i, part := range parts {
+		b.Store(b.Advance(data, p.Val(i)), part)
+	}
+	var buffer Expr
+	if useStackBuffer {
+		buffer = b.stringStackBuffer()
+	} else {
+		buffer = p.Nil(p.VoidPtr())
+	}
+	result := b.InlineCall(b.Pkg.rtFunc("StringConcat"), data, p.Val(len(parts)), buffer)
+	if p.GCRootsEnabled() {
+		// A registered table lives until function return. Release the input
+		// references now that the result owns its bytes.
+		b.zeroinit(table, p.IntVal(p.SizeOf(p.Elem(table.Type)), p.Uintptr()))
+	}
+	return Expr{result.impl, resultType}
+}
+
 func (b Builder) stringStackBuffer() Expr {
 	return b.uninitializedStackSlot(b.Prog.Type(types.NewArray(types.Typ[types.Byte], llabi.SmallStackBufferSize), GoDecl))
 }

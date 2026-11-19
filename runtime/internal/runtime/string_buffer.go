@@ -47,16 +47,14 @@ func StringToBytesBuffer(s String, buffer *[abi.SmallStackBufferSize]byte) []byt
 }
 
 func StringCatBuffer(a, b String, buffer *[abi.SmallStackBufferSize]byte) String {
-	n := a.len + b.len
-	if uint(n) > uint(len(buffer)) || n < a.len {
-		return StringCat(a, b)
-	}
+	n := stringConcatLength(a.len, b.len)
 	if n == 0 {
 		return String{}
 	}
-	c.Memcpy(unsafe.Pointer(buffer), a.data, uintptr(a.len))
-	c.Memcpy(c.Advance(unsafe.Pointer(buffer), a.len), b.data, uintptr(b.len))
-	return String{unsafe.Pointer(buffer), n}
+	dest := stringConcatStorage(n, buffer)
+	c.MemcpyIntrinsic(dest, a.data, uintptr(a.len), false)
+	c.MemcpyIntrinsic(unsafe.Add(dest, uintptr(a.len)), b.data, uintptr(b.len), false)
+	return String{dest, n}
 }
 
 func StringToRunesBuffer(s string, buffer *[abi.SmallStackBufferSize]rune) []rune {

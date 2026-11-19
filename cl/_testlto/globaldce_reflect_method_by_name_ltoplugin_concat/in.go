@@ -134,11 +134,15 @@ func multiTypeSuffix() string {
 }
 
 func multiValueName() string {
-	return multiPrefix() + multiMiddle() + multiValueSuffix()
+	// Evaluate the calls before the ADD chain so bounded concatenation fusion
+	// can run. This also exercises the plugin's stack-table string recovery.
+	prefix, middle, suffix := multiPrefix(), multiMiddle(), multiValueSuffix()
+	return prefix + middle + suffix
 }
 
 func multiTypeName() string {
-	return multiPrefix() + multiMiddle() + multiTypeSuffix()
+	prefix, middle, suffix := multiPrefix(), multiMiddle(), multiTypeSuffix()
+	return prefix + middle + suffix
 }
 
 func sliceValueName() string {

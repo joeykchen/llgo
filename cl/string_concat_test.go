@@ -1,0 +1,316 @@
+package cl
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	llabi "github.com/xgo-dev/llgo/internal/abi"
+	"github.com/xgo-dev/llgo/internal/cabi"
+	"github.com/xgo-dev/llgo/internal/filecheck"
+	llssa "github.com/xgo-dev/llgo/ssa"
+	"github.com/xgo-dev/llvm"
+	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
+)
+
+func TestStringConcatLowering(t *testing.T) {
+	ir := compileInterfaceBoxIR(t, `package concatlower
+func fused(a, b, c string) string { return a + b + c }
+type named string
+func namedFused(a, b, c named) named { return a + b + c }
+type alias = named
+func aliasFused(a, b, c alias) alias { return a + b + c }
+func balanced(a, b, c, d string) string { return (a + b) + (c + d) }
+func local(a, b, c string) int { return len(a + b + c) }
+func exactBuffer(s string) int { return len("0123456789abcdef" + s + "0123456789abcdef") }
+func exceedsBuffer(s string) int { return len("0123456789abcdef" + s + "0123456789abcdef!") }
+func sharedRoot(a, b, c string) (string, string) { x := a + b + c; return x, x }
+func shared(a, b, c string) string { x := a + b; sink(x); return x + c }
+func sharedLeaf(a, b, c, d string) string { x := a+b; sink(x); return x+c+d }
+func sharedChains(a, b, c, d, e string) string { x := a+b+c; sink(x); return x+d+e }
+func crossBlockChains(a, b, c, d, e string, branch bool) string { x := a+b+c; if branch { sink(d) }; return x+d+e }
+func dominant(a, b, c string, branch bool) string { x := id(a); if branch { sink(b) }; return x+b+c }
+func interleaved(a, b, c string) string { return a+b+id(c) }
+func oversized(a string) string { return a+a+a+a+a+a+a+a+a+a+a+a+a+a+a+a+a }
+func id(s string) string { return s }
+func sink(string)
+`, ssa.InstantiateGenerics, nil, false)
+	for _, tc := range []struct {
+		name           string
+		concat, binary int
+	}{
+		{"fused", 1, 0}, {"namedFused", 1, 0}, {"aliasFused", 1, 0},
+		{"balanced", 1, 0}, {"local", 1, 0}, {"sharedRoot", 1, 0},
+		{"exactBuffer", 1, 0}, {"exceedsBuffer", 1, 0},
+		{"sharedLeaf", 1, 1}, {"sharedChains", 2, 0}, {"crossBlockChains", 2, 0},
+		{"dominant", 1, 0}, {"shared", 0, 2}, {"interleaved", 0, 2}, {"oversized", 0, 16},
+	} {
+		body := llvmFunction(t, ir, "concatlower."+tc.name)
+		concat := strings.Count(body, "runtime/internal/runtime.StringConcat")
+		binary := strings.Count(body, "runtime/internal/runtime.StringCat")
+		if concat != tc.concat || binary != tc.binary {
+			t.Fatalf("%s: concat/binary calls = %d/%d, want %d/%d:\n%s", tc.name, concat, binary, tc.concat, tc.binary, body)
+		}
+	}
+	for name, want := range map[string]bool{"fused": false, "local": true, "exactBuffer": true, "exceedsBuffer": false} {
+		if got := strings.Contains(llvmFunction(t, ir, "concatlower."+name), "alloca [32 x i8]"); got != want {
+			t.Errorf("%s: result stack buffer = %t, want %t", name, got, want)
+		}
+	}
+}
+
+func TestStringConcatLoweringWithRoots(t *testing.T) {
+	ir := compileInterfaceBoxIR(t, `package concatroots
+func fused(a, b, c string) string { return a + b + c }
+`, ssa.InstantiateGenerics, &llssa.Target{GOOS: "wasip1", GOARCH: "wasm", WasmProfile: "w32"}, true)
+	// W32 has four-byte pointers but 16-byte strings. Bind all three data
+	// addresses to distinct typed roots, then check table fill/copy/release order.
+	checks := `CHECK: [[STR:%".*String"]] = type { { ptr, i32 }, i64 }
+CHECK: @__llgo_gcroot_stack_pointer_4 = {{.*}}constant i8 4
+CHECK: @"concatroots.fused$gcmap" = {{.*}}i32 6, i32 6,
+CHECK-SAME: zeroinitializer, {{.*}}zeroinitializer, {{.*}}zeroinitializer,
+CHECK-SAME: ptr @__llgo_gcroot_stack_pointer_4
+CHECK-SAME: ptr @__llgo_gcroot_stack_pointer_4
+CHECK-SAME: ptr @__llgo_gcroot_stack_pointer_4
+CHECK-LABEL: @concatroots.fused(
+CHECK-SAME: [[STR]] [[A:%[0-9]+]], [[STR]] [[B:%[0-9]+]], [[STR]] [[C:%[0-9]+]])
+CHECK: [[TABLE:%.*]] = alloca [3 x [[STR]]]
+CHECK: [[ROOT0:%.*]] = getelementptr inbounds [6 x { ptr, i32 }], ptr [[ROOTS:%.*]], i32 0, i32 3
+CHECK: [[ROOT1:%.*]] = getelementptr inbounds [6 x { ptr, i32 }], ptr [[ROOTS]], i32 0, i32 4
+CHECK: [[ROOT2:%.*]] = getelementptr inbounds [6 x { ptr, i32 }], ptr [[ROOTS]], i32 0, i32 5
+CHECK: call void @llvm.memset.p0.i64(ptr [[TABLE]], i8 0, i64 48, i1 false)
+CHECK: [[PTR0:%.*]] = ptrtoint ptr [[TABLE]] to i32
+CHECK-NEXT: [[WORD0:%.*]] = zext i32 [[PTR0]] to i64
+CHECK-NEXT: store i64 [[WORD0]], ptr [[ROOT0]]
+CHECK: [[DATA1:%.*]] = getelementptr inbounds i8, ptr [[TABLE]], i64 16
+CHECK-NEXT: [[PTR1:%.*]] = ptrtoint ptr [[DATA1]] to i32
+CHECK-NEXT: [[WORD1:%.*]] = zext i32 [[PTR1]] to i64
+CHECK-NEXT: store i64 [[WORD1]], ptr [[ROOT1]]
+CHECK: [[DATA2:%.*]] = getelementptr inbounds i8, ptr [[TABLE]], i64 32
+CHECK-NEXT: [[PTR2:%.*]] = ptrtoint ptr [[DATA2]] to i32
+CHECK-NEXT: [[WORD2:%.*]] = zext i32 [[PTR2]] to i64
+CHECK-NEXT: store i64 [[WORD2]], ptr [[ROOT2]]
+CHECK: [[SLOT0:%.*]] = getelementptr [[STR]], ptr [[TABLE]], i32 0
+CHECK-NEXT: store [[STR]] [[A]], ptr [[SLOT0]]
+CHECK-NEXT: [[SLOT1:%.*]] = getelementptr [[STR]], ptr [[TABLE]], i32 1
+CHECK-NEXT: store [[STR]] [[B]], ptr [[SLOT1]]
+CHECK-NEXT: [[SLOT2:%.*]] = getelementptr [[STR]], ptr [[TABLE]], i32 2
+CHECK-NEXT: store [[STR]] [[C]], ptr [[SLOT2]]
+CHECK-NEXT: {{%.*}} = call [[STR]] @"github.com/xgo-dev/llgo/runtime/internal/runtime.StringConcat"(ptr [[TABLE]], i64 3, ptr null)
+CHECK-NEXT: call void @llvm.memset.p0.i64(ptr [[TABLE]], i8 0, i64 48, i1 false)
+`
+	path := filepath.Join(t.TempDir(), "concat.check")
+	if err := os.WriteFile(path, []byte(checks), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := filecheck.Match(path, ir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStringConcatTargetABI(t *testing.T) {
+	const stringType = `%"github.com/xgo-dev/llgo/runtime/internal/runtime.String"`
+	for _, tc := range []struct {
+		target      llssa.Target
+		result      string
+		pointerSize int
+	}{
+		{llssa.Target{GOOS: "windows", GOARCH: "amd64"}, "void", 8},
+		{llssa.Target{GOOS: "linux", GOARCH: "amd64"}, "{ ptr, i64 }", 8},
+		{llssa.Target{GOOS: "linux", GOARCH: "arm64"}, stringType, 8},
+		{llssa.Target{GOOS: "wasip1", GOARCH: "wasm", WasmProfile: "w32"}, "void", 4},
+		{llssa.Target{GOOS: "js", GOARCH: "wasm", WasmProfile: "j64", LLVMTarget: "wasm64-unknown-emscripten"}, "void", 8},
+	} {
+		target := tc.target
+		t.Run(strings.TrimRight(target.GOOS+"/"+target.GOARCH+"/"+target.WasmProfile, "/"), func(t *testing.T) {
+			ssapkg, _, files := buildGoSSAPkg(t, `package concatabi
+func fused(a, b, c string) string { return a+b+c }
+func local(a, b, c string) int { return len(a+b+c) }
+`)
+			prog := newLLSSAProgForTarget(t, &target)
+			defer prog.Dispose()
+			if prog.PointerSize() != tc.pointerSize || prog.GoWordSize() != 8 || prog.SizeOf(prog.String()) != 16 {
+				t.Fatalf("pointer/Go word/string sizes = %d/%d/%d, want %d/8/16", prog.PointerSize(), prog.GoWordSize(), prog.SizeOf(prog.String()), tc.pointerSize)
+			}
+			pkg, err := NewPackage(prog, ssapkg, files)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mod := pkg.Module()
+			mod.SetDataLayout(prog.DataLayout())
+			mod.SetTarget(target.Spec().Triple)
+			config := llabi.AggregateLoweringConfig{GoWordSize: prog.GoWordSize(), Wasm: target.GOARCH == "wasm"}
+			llabi.LowerLargeAggregates(prog.TargetData(), mod, config)
+			cabi.NewTransformer(prog, target.Spec().Triple, "", false).TransformModule(pkg.Path(), mod)
+			llabi.LowerAggregateCopies(prog.TargetData(), mod, config)
+			if err := llvm.VerifyModule(mod, llvm.ReturnStatusAction); err != nil {
+				t.Fatal(err)
+			}
+			// Bind the real table, optional byte buffer, and ABI result slot so a
+			// declaration-only check cannot hide swapped or missing arguments.
+			for _, name := range []string{"fused", "local"} {
+				checks, outArg, buffer := "", "", "null"
+				if tc.result == "void" {
+					checks += "CHECK: [[OUT:%.*]] = alloca " + stringType + ", align 8\n"
+					outArg = "ptr sret(" + stringType + ") [[OUT]], "
+				}
+				if name == "local" {
+					checks += "CHECK: [[BUFFER:%.*]] = alloca [32 x i8]\n"
+					buffer = "[[BUFFER]]"
+				}
+				checks += "CHECK: [[TABLE:%.*]] = alloca [3 x " + stringType + "], align 8\n"
+				checks += "CHECK: call " + tc.result + " @\"github.com/xgo-dev/llgo/runtime/internal/runtime.StringConcat\"(" + outArg + "ptr [[TABLE]], i64 3, ptr " + buffer + ")\n"
+				if tc.result == "void" {
+					checks += "CHECK-NEXT: {{%.*}} = load " + stringType + ", ptr [[OUT]], align 8\n"
+				}
+				path := filepath.Join(t.TempDir(), "concat.check")
+				if err := os.WriteFile(path, []byte(checks), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := filecheck.Match(path, mustNamedFunction(t, mod, "concatabi."+name).String()); err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+			}
+			assembly, err := prog.TargetMachine().EmitToMemoryBuffer(mod, llvm.AssemblyFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assembly.Dispose()
+		})
+	}
+}
+
+func TestCollectStringConcatPlan(t *testing.T) {
+	pkg, _, _ := buildGoSSAPkg(t, `package concat
+func sink(string)
+func id(s string) string { return s }
+func fused(a, b, c string) string { return a + b + c }
+func shared(a, b, c string) string { x := a + b; sink(x); return x + c }
+func interleaved(a, b, c string) string { x := a + b; y := id(c); return x + y }
+func oversized(a string) string {
+	return a+a+a+a+a+a+a+a+a+a+a+a+a+a+a+a+a
+}
+func limit(a string) string { return `+strings.Repeat("a+", maxStringConcatParts-1)+`a }
+func crossBlock(a, b, c string, branch bool) string { x := a+b; if branch { return x+c }; return x }
+func repeated(a, b string) string { x := a+b; return x+x }
+func interleavedMutation(buf []byte, b, c string) string { x := string(buf)+b; buf[0]='x'; return x+c }
+func dominant(a, b, c string, branch bool) string { x := id(a); if branch { sink(b) }; return x+b+c }
+func sharedLeaf(a, b, c, d string) string { x := a+b; sink(x); return x+c+d }
+func crossBlockLeaf(a, b, c, d string, branch bool) string { x := a+b; if branch { sink(c) }; return x+c+d }
+`)
+
+	for _, tc := range []struct {
+		name  string
+		parts int
+	}{
+		{"fused", 3}, {"limit", maxStringConcatParts}, {"oversized", 0},
+		{"shared", 0}, {"interleaved", 0}, {"crossBlock", 0},
+		{"repeated", 0}, {"interleavedMutation", 0},
+		{"dominant", 3}, {"sharedLeaf", 3}, {"crossBlockLeaf", 3},
+	} {
+		root := lastStringAdd(pkg.Func(tc.name))
+		index := slices.Index(root.Block().Instrs, ssa.Instruction(root))
+		plan := collectStringConcatPlan(root, index, nil)
+		if (plan != nil) != (tc.parts > 0) || plan != nil && (len(plan.parts) != tc.parts || len(plan.intermediates) != tc.parts-2) {
+			t.Fatalf("%s: plan = %#v, want %d parts", tc.name, plan, tc.parts)
+		}
+		if plan != nil {
+			static := map[ssa.Instruction]none{plan.intermediates[0]: {}}
+			if collectStringConcatPlan(root, index, static) != nil {
+				t.Fatalf("%s: fused an intermediate handled by static initialization", tc.name)
+			}
+		}
+	}
+}
+
+func TestStringConcatDebugRefs(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "concat.go", `package concatdebug
+func join(a, b, c string) string { x := a+b; return x+c }
+`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []*ast.File{file}
+	pkg, _, err := ssautil.BuildPackage(&types.Config{}, fset, types.NewPackage("concatdebug", "concatdebug"), files,
+		ssa.SanityCheckFunctions|ssa.InstantiateGenerics|ssa.GlobalDebug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := lastStringAdd(pkg.Func("join"))
+	plan := collectStringConcatPlan(root, slices.Index(root.Block().Instrs, ssa.Instruction(root)), nil)
+	if plan == nil || len(plan.intermediates) != 1 {
+		t.Fatal("DebugRef prevented concat fusion")
+	}
+	hasDebugRef := false
+	for _, ref := range *plan.intermediates[0].Referrers() {
+		if _, ok := ref.(*ssa.DebugRef); ok {
+			hasDebugRef = true
+		}
+	}
+	if !hasDebugRef {
+		t.Fatal("fixture must have a DebugRef to the eliminated intermediate")
+	}
+	prog := newLLSSAProgForTarget(t, &llssa.Target{GOOS: "linux", GOARCH: "amd64"})
+	defer prog.Dispose()
+	compiled, _, err := newPackageEx(prog, nil, nil, nil, pkg, files, nil, false, Options{Debug: true, DebugSymbols: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := llvm.VerifyModule(compiled.Module(), llvm.ReturnStatusAction); err != nil {
+		t.Fatal(err)
+	}
+	body := llvmFunction(t, compiled.String(), "concatdebug.join")
+	if strings.Count(body, "runtime/internal/runtime.StringConcat") != 1 || strings.Contains(body, "runtime/internal/runtime.StringCat") {
+		t.Fatalf("debug lowering rematerialized an eliminated concat:\n%s", body)
+	}
+}
+
+func TestStringConcatPlanBudget(t *testing.T) {
+	// A rejected four-part chain must not fall back to fusing its cheaper
+	// three-part prefix, even when that prefix would fit the remaining budget.
+	const parts = 4
+	pkg, _, _ := buildGoSSAPkg(t, `package concatbudget
+func join(a, b, c, d string) string { return a+b+c+d }
+`)
+	for _, roots := range []bool{false, true} {
+		prog := newLLSSAProgForTarget(t, &llssa.Target{GOOS: "wasip1", GOARCH: "wasm"})
+		defer prog.Dispose()
+		prog.EnableGCRoots(roots)
+		module := prog.NewPackage("concatbudget", "concatbudget")
+		fn := pkg.Func("join")
+		lowered := module.NewFunc("join", fn.Signature, llssa.GoDecl)
+		ctx := &context{prog: prog, fn: lowered}
+		table := prog.Type(types.NewArray(types.Typ[types.String], parts), llssa.GoDecl)
+		cost := prog.SizeOf(table) + prog.StackRootBytes(table)
+		lowered.SetEscapeStackBytes(llabi.MaxEscapeStackBytes - cost + 1)
+		ctx.prepareStringConcatPlans(fn)
+		if ctx.concatPlans != nil {
+			t.Fatalf("roots=%v: over-budget plan was accepted", roots)
+		}
+		lowered.SetEscapeStackBytes(llabi.MaxEscapeStackBytes - cost)
+		ctx.prepareStringConcatPlans(fn)
+		if len(ctx.concatPlans[lastStringAdd(fn)]) != parts {
+			t.Fatalf("roots=%v: exact-budget plan was rejected", roots)
+		}
+	}
+}
+
+func lastStringAdd(fn *ssa.Function) *ssa.BinOp {
+	for i := len(fn.Blocks) - 1; i >= 0; i-- {
+		instrs := fn.Blocks[i].Instrs
+		for j := len(instrs) - 1; j >= 0; j-- {
+			if add, ok := instrs[j].(*ssa.BinOp); ok && isStringAdd(add) {
+				return add
+			}
+		}
+	}
+	panic("missing string add")
+}

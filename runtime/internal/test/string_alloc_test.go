@@ -19,6 +19,111 @@ func runtimeStringValue(s rt.String) string {
 	return *(*string)(unsafe.Pointer(&s))
 }
 
+func concatStrings(parts []rt.String, buffer *[32]byte) rt.String {
+	return rt.StringConcat(unsafe.SliceData(parts), len(parts), buffer)
+}
+
+func TestStringConcat(t *testing.T) {
+	if got := runtimeStringValue(concatStrings(nil, nil)); got != "" {
+		t.Fatalf("StringConcat(empty) = %q", got)
+	}
+	// Mixed empty, NUL and invalid UTF-8 inputs are copied as bytes.
+	parts := []rt.String{stringRuntimeValue("a"), {}, stringRuntimeValue("\x00\xff")}
+	if got := runtimeStringValue(concatStrings(parts, nil)); got != "a\x00\xff" {
+		t.Fatalf("StringConcat = %q", got)
+	}
+}
+
+func TestStringConcatBufferBoundary(t *testing.T) {
+	for _, size := range []int{0, 1, 31, 32, 33, 64} {
+		text := strings.Repeat("x", size)
+		parts := []rt.String{stringRuntimeValue(text[:size/2]), stringRuntimeValue(""), stringRuntimeValue(text[size/2:])}
+		var buffer [32]byte
+		got := runtimeStringValue(concatStrings(parts, &buffer))
+		if got != text {
+			t.Fatalf("size %d: got %q, want %q", size, got, text)
+		}
+		if size == 0 {
+			continue
+		}
+		inBuffer := unsafe.StringData(got) == &buffer[0]
+		if inBuffer != (size <= len(buffer)) {
+			t.Fatalf("size %d: caller buffer used = %v", size, inBuffer)
+		}
+	}
+}
+
+func TestStringConcatCopiesSingleNonEmptyInput(t *testing.T) {
+	for _, buffered := range []bool{false, true} {
+		var source, destination [32]byte
+		copy(source[:], "owned")
+		input := unsafe.String(&source[0], len("owned"))
+		parts := []rt.String{stringRuntimeValue(""), stringRuntimeValue(input), stringRuntimeValue("")}
+		var buffer *[32]byte
+		if buffered {
+			buffer = &destination
+		}
+		got := runtimeStringValue(concatStrings(parts, buffer))
+		if unsafe.StringData(got) == &source[0] {
+			t.Fatalf("buffered=%v: result borrowed input storage", buffered)
+		}
+		if got != "owned" {
+			t.Fatalf("buffered=%v: got %q, want owned", buffered, got)
+		}
+		runtime.KeepAlive(parts)
+	}
+}
+
+func invalidLengthString(length int) rt.String {
+	// No data backs this header. Tests must reject the length before reading
+	// its data or attempting a large allocation.
+	header := struct {
+		data unsafe.Pointer
+		len  int
+	}{len: length}
+	return *(*rt.String)(unsafe.Pointer(&header))
+}
+
+func checkStringConcatLengthPanic(t *testing.T, a, b int) {
+	t.Helper()
+	left, right := invalidLengthString(a), invalidLengthString(b)
+	for _, call := range []struct {
+		name string
+		fn   func()
+	}{
+		{"binary", func() { rt.StringCat(left, right) }},
+		{"buffered binary", func() {
+			var buffer [32]byte
+			rt.StringCatBuffer(left, right, &buffer)
+		}},
+		{"multiple", func() {
+			parts := []rt.String{left, right}
+			concatStrings(parts, nil)
+		}},
+	} {
+		func() {
+			defer func() {
+				if got := recover(); got != "runtime: string concat length out of range" {
+					t.Errorf("%s lengths (%d, %d): panic = %v", call.name, a, b, got)
+				}
+			}()
+			call.fn()
+		}()
+	}
+}
+
+func TestStringConcatInvalidLength(t *testing.T) {
+	checkStringConcatLengthPanic(t, -1, 0)
+	checkStringConcatLengthPanic(t, 0, -1)
+	checkStringConcatLengthPanic(t, int(^uint(0)>>1), 1)
+	if ^uint(0)>>63 != 0 {
+		// Both lengths fit a 64-bit Go int, but their sum exceeds the
+		// runtime's 48-bit allocation limit (or Wasm32's narrower limit).
+		part := int64(1) << 47
+		checkStringConcatLengthPanic(t, int(part), int(part+1))
+	}
+}
+
 func TestStringAllocationContents(t *testing.T) {
 	for _, text := range []string{"", "hello", "a\x00b", "中文🙂", strings.Repeat("a\x00界🙂", 1024)} {
 		data := []byte(text)
@@ -35,6 +140,11 @@ func TestStringAllocationContents(t *testing.T) {
 			if joined != text+suffix {
 				t.Fatalf("StringCat(%q, %q) = %q", text, suffix, joined)
 			}
+			var buffer [32]byte
+			buffered := runtimeStringValue(rt.StringCatBuffer(stringRuntimeValue(text), stringRuntimeValue(suffix), &buffer))
+			if buffered != text+suffix {
+				t.Fatalf("StringCatBuffer(%q, %q) = %q", text, suffix, buffered)
+			}
 		}
 
 		cstr := rt.CStrDup(stringRuntimeValue(text))
@@ -50,6 +160,7 @@ func TestStringAllocationsSurviveGC(t *testing.T) {
 	type liveString struct {
 		copied string
 		joined string
+		fused  string
 		tail   string
 		cstr   *int8
 	}
@@ -60,9 +171,12 @@ func TestStringAllocationsSurviveGC(t *testing.T) {
 		data := []byte(text)
 		copied := runtimeStringValue(rt.StringFrom(unsafe.Pointer(unsafe.SliceData(data)), len(data)))
 		joined := runtimeStringValue(rt.StringCat(stringRuntimeValue(text), stringRuntimeValue("tail")))
+		parts := []rt.String{stringRuntimeValue(text[:17]), stringRuntimeValue(text[17:]), stringRuntimeValue("tail")}
+		fused := runtimeStringValue(concatStrings(parts, nil))
 		values[i] = liveString{
 			copied: copied,
 			joined: joined,
+			fused:  fused,
 			tail:   joined[17:],
 			cstr:   rt.CStrDup(stringRuntimeValue(text)),
 		}
@@ -72,7 +186,7 @@ func TestStringAllocationsSurviveGC(t *testing.T) {
 	}
 	for i, value := range values {
 		want := strings.Repeat(string(rune('a'+i)), 4096) + "\x00界🙂"
-		if value.copied != want || value.joined != want+"tail" || value.tail != (want + "tail")[17:] {
+		if value.copied != want || value.joined != want+"tail" || value.fused != want+"tail" || value.tail != (want + "tail")[17:] {
 			t.Fatalf("string %d changed after GC", i)
 		}
 		bytes := unsafe.Slice((*byte)(unsafe.Pointer(value.cstr)), len(want)+1)

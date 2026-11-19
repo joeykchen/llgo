@@ -196,6 +196,7 @@ type context struct {
 	skips                map[string]none
 	loaded               map[*types.Package]*pkgInfo // loaded packages
 	bvals                map[ssa.Value]llssa.Expr    // block values
+	concatPlans          stringConcatPlans
 	methodNilDerefChecks map[*ssa.UnOp]none
 	recvNilDerefChecks   map[*ssa.UnOp]token.Pos
 	nilCheckBlock        *ssa.BasicBlock
@@ -848,6 +849,7 @@ func (p *context) compileFuncDecl(pkg llssa.Package, f *ssa.Function) (llssa.Fun
 			oldLocalityFunction := p.locality.function
 			oldRecoverSlots, oldImplicitDeferResults := p.recoverSlots, p.implicitDeferResults
 			oldGCRoots, oldGCClosureRoot := p.gcRoots, p.gcClosureRoot
+			oldConcatPlans := p.concatPlans
 			oldSafepointEntry, oldSafepoints := p.safepointEntry, p.safepoints
 			p.fn = fn
 			p.goFn = f
@@ -867,6 +869,7 @@ func (p *context) compileFuncDecl(pkg llssa.Package, f *ssa.Function) (llssa.Fun
 				p.recoverSlots = oldRecoverSlots
 				p.implicitDeferResults = oldImplicitDeferResults
 				p.gcRoots, p.gcClosureRoot = oldGCRoots, oldGCClosureRoot
+				p.concatPlans = oldConcatPlans
 				p.safepointEntry, p.safepoints = oldSafepointEntry, oldSafepoints
 			}()
 			p.phis = nil
@@ -893,6 +896,7 @@ func (p *context) compileFuncDecl(pkg llssa.Package, f *ssa.Function) (llssa.Fun
 			p.bvals = make(map[ssa.Value]llssa.Expr)
 			p.mapLitLoops = collectLargeMapLits(f)
 			p.applyMapLitPlans(p.mapLitLoops)
+			p.prepareStringConcatPlans(f)
 			p.methodNilDerefChecks, p.recvNilDerefChecks = collectMethodNilDerefChecks(f, p.options.ReceiverNilChecks)
 			p.prepareCooperativeSafepoints(f, isCgo)
 			p.prepareGCRoots(f, hasCtx)
@@ -1720,6 +1724,14 @@ func (p *context) compileInstrOrValue(b llssa.Builder, iv instrOrValue, asValue 
 			b.DeferStackDrain()
 		}
 	case *ssa.BinOp:
+		if parts, planned := p.concatPlans[v]; planned {
+			if parts == nil {
+				return
+			}
+			useStackBuffer := p.stackStorage(v) && concatMayFitStackBuffer(parts)
+			ret = b.StringConcat(p.compileValues(b, parts, 0), p.type_(v.Type(), llssa.GoDecl), useStackBuffer)
+			break
+		}
 		if value, ok := foldConstComparison(v); ok {
 			ret = p.prog.BoolVal(value)
 			break

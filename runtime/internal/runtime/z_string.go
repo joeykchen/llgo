@@ -19,6 +19,7 @@ package runtime
 import (
 	"unsafe"
 
+	"github.com/xgo-dev/llgo/runtime/abi"
 	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
@@ -37,11 +38,57 @@ type String struct {
 
 // StringCat concatenates two strings.
 func StringCat(a, b String) String {
-	n := a.len + b.len
-	dest := AllocAtomicU(uintptr(n))
-	c.Memcpy(dest, a.data, uintptr(a.len))
-	c.Memcpy(c.Advance(dest, a.len), b.data, uintptr(b.len))
-	return String{dest, n}
+	return StringCatBuffer(a, b, nil)
+}
+
+// StringConcat borrows count initialized strings starting at data for this call.
+// Separate pointer and count arguments avoid a platform-specific slice ABI.
+// The caller keeps every input alive through the copy. A non-nil buffer must
+// be disjoint from all inputs and is used only when the complete result fits.
+// Even a sole non-empty input is copied because it may refer to a stack slot.
+func StringConcat(data *String, count int, buffer *[abi.SmallStackBufferSize]byte) String {
+	parts := unsafe.Slice(data, count)
+	total := 0
+	for _, part := range parts {
+		total = stringConcatLength(total, part.len)
+	}
+	if total == 0 {
+		return String{}
+	}
+	dest := stringConcatStorage(total, buffer)
+	offset := 0
+	// The table was validated above; direct loads avoid per-copy bounds checks.
+	for i := 0; i < count; i++ {
+		part := c.Index(data, i)
+		if part.len == 0 {
+			continue
+		}
+		c.Memcpy(unsafe.Add(dest, uintptr(offset)), part.data, uintptr(part.len))
+		offset += part.len
+	}
+	return String{dest, total}
+}
+
+// The length has already been validated and is non-zero. All concatenation
+// entry points use the same destination policy without rechecking the sum.
+func stringConcatStorage(length int, buffer *[abi.SmallStackBufferSize]byte) unsafe.Pointer {
+	if buffer != nil && length <= len(buffer) {
+		return unsafe.Pointer(&buffer[0])
+	}
+	return AllocAtomicU(uintptr(length))
+}
+
+func stringConcatLength(total, part int) int {
+	n := total + part
+	// With two nonnegative lengths, signed overflow makes n negative.
+	if total < 0 || part < 0 || n < 0 || uint64(n) > stringConcatMaxAlloc {
+		panicStringConcatLength()
+	}
+	return n
+}
+
+func panicStringConcatLength() {
+	panic("runtime: string concat length out of range")
 }
 
 // -----------------------------------------------------------------------------
